@@ -20,8 +20,19 @@ from rich import print as rprint
 from rich.panel import Panel
 from textwrap import dedent
 from mydebug import timer
+from mydebug import db
 
 # TODO: handle sigint.
+
+
+# TODO: handle next variables.
+tot_cells = 0
+swiss_cells = 0
+no_swiss_cells = 0
+ocid_identified = 0
+google_identified = 0
+combain_identified = 0
+
 
 # Questionary styling.
 custom_style = Style([
@@ -108,9 +119,18 @@ def json_to_dataframe(js_file):
 
     # Load json file to dataframe.
     df = pd.read_json(js_file)
+    df['imei'] = df['imei'].astype('Int64', copy=False)
+    df.to_csv('df.tsv', sep='\t')
+    global tot_cells
+    tot_cells = df.shape[0]
+
+
+    # WARNING: dropna() appears to crash the structure.
+    # df = df.dropna()
+    # df.to_csv('df_dropna.tsv', sep='\t')
 
     # Takes only 14-digit number as n15 is check-digit.
-    df['imei'] = df['imei'].astype(str).str[:14].astype('Int64')
+    # df['imei'] = df['imei'].astype(str).str[:14].astype('Int64', copy=False) # WARNING: could be problematic.
 
     # Check the content of columns for dictionaries.
     hasdic = []
@@ -127,6 +147,7 @@ def json_to_dataframe(js_file):
         identify_column_content_type(df[col], col)
 
     # rprint(f"Needs flattening:\n[green]{hasdic}[/]")
+    # ['domainId', 'targetIPAddress', 'correlationNumber', 'area', 'cell', 'location', 'additionalProperties']
 
     # If 'location' column not found, it means only non-Swiss cells found.
     # The column is created with np.nan values to get same location format.
@@ -143,12 +164,12 @@ def json_to_dataframe(js_file):
                 }]
         df['location'] = pd.DataFrame(data)
 
-        # Prevent flattening column "addtionalProperties" (redundant data).
-        # Only found in non-Swiss data.
-        try:
-            hasdic.remove('additionalProperties')
-        except Exception as exc:
-            rprint(f"Exception: [red]{exc}[/]")
+    # Prevent flattening column "addtionalProperties" (redundant data).
+    # Only found in non-Swiss data.
+    try:
+        hasdic.remove('additionalProperties')
+    except Exception as exc:
+        rprint(f"Exception: [red]{exc}[/]")
 
     # Flattening columns.
     flattened_dfs = {}
@@ -168,43 +189,72 @@ def json_to_dataframe(js_file):
         df = pd.concat([df, flattened_dfs[col]], axis=1)
 
     # Remove empty cell_id.
-    df = df.dropna(subset=['cell_id'])
+    base_df = df.dropna(subset=['cell_id'])
+
+    base_df.to_csv('base_df.tsv', sep='\t')
+
+    # Split column 'cell_id' (dtypes: object) into values' specific element.
+    base_df = base_df.copy() # Ensure working on copy.
+    base_df['mcc'] = base_df['cell_id'].apply(lambda x: x.split('-')[0])
+    base_df['mnc'] = base_df['cell_id'].apply(lambda x: x.split('-')[1])
+    base_df['lac'] = base_df.apply(lambda x: x['cell_id'].split('-')[2] if x['cell_idtype'] == 'CGI' else np.nan, axis=1)
+    base_df['cid'] = base_df['cell_id'].apply(lambda x: x.split('-')[-1])
+
+    return base_df
+
+def split_process_concat_dataframe(dataframe):
+    '''
+    Split base dataframe, get locations and concat again.
+
+    sdf: Swiss Dataframe, no processing as location already known.
+    nosdf: non-Swiss Dataframe, crosscheck against cell-tower db.
+    '''
+
+    # Remove non-necessary columns.
+    rm_cols = ['aPN',
+               'iriType',
+               'accessType',
+               'iriSubType',
+               'operatorId',
+               'originator',
+               'destination',
+               'targetAddressType',
+               'additionalProperties',
+               'domainId_header',
+               'correlationNumber_value',
+               'cell_timestampType',
+               'location_lv03.e',
+               'location_lv03.n',
+               'location_lv95.e',
+               'location_lv95.n']
+
+    df = dataframe.drop(rm_cols, axis=1)
 
     # Split df to Swiss and non-Swiss cell_id dfs.
     filt = df['cell_id'].str.startswith('228')
     sdf = df[filt]
     nosdf = df[~filt]
+    nosdf = nosdf.astype({'mcc': 'Int32', 'mnc': 'Int8', 'lac': 'Int32', 'cid': 'Int32'})
 
-    # TEST: simulate getting location from db.
-    # Foreign cell_ids can have both formats (MCC-MNC-LAC-ID or MCC-MNC-ID).
-    # To take into consideration later.
-    # 230-01-107776267
-    # 230-01-14418-20977
+    # Path to openCellID database.
+    openCellID = '/home/anon/Desktop/it_stuff/openCellID/cell_towers.parquet'
 
-    cities_dic = {'London': [+51.5002, -0.1262],
-                  'Oslo': [+59.9138, +10.7387],
-                  'Rome': [+41.8955, +12.4823],
-                  'Washington': [+38.8921, -77.0241],
-                  'Pretoria': [-25.7463, +28.1876],
-                  'Canberra': [-35.2820, +149.1286],
-                  'Wales': [+65.620, -168.1336],
-                  'McMurdo': [-77.8401, +166.6424],
-                  'Svalbard': [+77.2408, +12.1280]}
+    ocid_df = pd.read_parquet(openCellID, columns=['mcc', 'net', 'area', 'cell', 'lon', 'lat'])
 
-    cities = ['London', 'Oslo', 'Rome', 'Washington', 'Pretoria', 'Canberra', 'Wales', 'McMurdo', 'Svalbard']
+    # Merge nosdf and ocid_df on country and cell id number.
+    merged_df = nosdf.merge(ocid_df[['mcc', 'cell', 'lat', 'lon']], left_on=['mcc', 'cid'], right_on=['mcc', 'cell'], how='left')
 
-    cellids = nosdf['cell_id']
-    import random
-    for cell in cellids:
-        filt = (nosdf['cell_id'] == cell)
-        city = random.choice(cities)
-        latitude = cities_dic[city][0]
-        longitude = cities_dic[city][1]
-        azimuth = random.randrange(0,360,10)
+    # Ensure proper handling of NaN values.
+    merged_df['lat'] = pd.to_numeric(merged_df['lat'], errors='coerce')
+    merged_df['lon'] = pd.to_numeric(merged_df['lon'], errors='coerce')
 
-        nosdf.loc[filt, 'location_wgs84.latitude'] = latitude
-        nosdf.loc[filt, 'location_wgs84.longitude'] = longitude
-        nosdf.loc[filt, 'location_azimuth'] = azimuth
+    # Populate ocid_df values to nosdf when match occurs.
+    merged_df['location_wgs84.latitude'] = merged_df['location_wgs84.latitude'].fillna(merged_df['lat'])
+    merged_df['location_wgs84.longitude'] = merged_df['location_wgs84.longitude'].fillna(merged_df['lon'])
+
+    merged_df = merged_df.drop(['lat', 'lon', 'cell'], axis=1)
+
+    nosdf = merged_df
 
     # Create the final dataframe.
     df = pd.concat([sdf, nosdf], axis=0)
@@ -214,7 +264,7 @@ def json_to_dataframe(js_file):
 
 
 class Cell():
-    def __init__(self, id, imei, latitude, longitude, azimuth, networkElementId, first_seen, last_seen, count):
+    def __init__(self, id, imei, latitude, longitude, azimuth, networkElementId, first_seen, last_seen, count, mcc):
         self.id = id
         self.imei = imei
         self.latitude = latitude
@@ -224,6 +274,7 @@ class Cell():
         self.first_seen = first_seen
         self.last_seen = last_seen
         self.count = count
+        self.mcc = mcc
 
     def increment_cell_count(self):
         self.count += 1
@@ -239,21 +290,18 @@ class Cell():
 def dataframe_parser(dataframe):
     '''Parse the dataframe to get cell location related data only.'''
 
-    # if dataframe.empty:
-    #     celldf = pd.DataFrame()
-    #     neteid_df = pd.DataFrame()
-    #     return celldf, neteid_df # neteid_df to be created.
-
     df = dataframe[['cell_id', 'imei', 'location_wgs84.latitude', 'location_wgs84.longitude',
-             'location_azimuth', 'cell_timestamp', 'networkElementId']]
-             # 'location_azimuth', 'cell_timestamp', 'ts', 'networkElementId']]
+             'location_azimuth', 'cell_timestamp', 'networkElementId', 'mcc']]
 
     # Convert timestamp to datetime, this will be beneficial later.
     pd.set_option('mode.chained_assignment', None)
     df['cell_timestamp'] = pd.to_datetime(df.loc[:, 'cell_timestamp'])
 
     # DO NOT REMOVE!
-    df = df.dropna()
+    df = df.dropna(subset=['location_wgs84.latitude', 'location_wgs84.longitude'], how='any')
+
+    # Fill in empty azimuth with 0, will only apply on non-Swiss cells.
+    df['location_azimuth'] = df['location_azimuth'].fillna(0)
 
     # Allow parsing data with visidata.
     df.to_csv('s2_cell_data.tsv', sep='\t', index=False)
@@ -268,6 +316,7 @@ def dataframe_parser(dataframe):
     for cell in cells:
         filt = (df['cell_id'] == cell)
         id = cell
+        mcc = df[filt]['mcc'].unique()[0]
         imei = df[filt]['imei'].unique()[0]
         lat = df[filt]['location_wgs84.latitude'].unique()[0]
         long = df[filt]['location_wgs84.longitude'].unique()[0]
@@ -277,7 +326,7 @@ def dataframe_parser(dataframe):
         network_element_id = df[filt]['networkElementId'].unique()[0]
         counts = df[filt].value_counts().sum()
 
-        cell = Cell(id, imei, lat, long, azimuth, network_element_id, firstSeen, lastSeen, counts)
+        cell = Cell(id, imei, lat, long, azimuth, network_element_id, firstSeen, lastSeen, counts, mcc)
         cell_dic[id] = cell
 
     # Build cells data and create dataframe.
@@ -286,6 +335,7 @@ def dataframe_parser(dataframe):
         try:
             cell_data.append({
                 'Cell_id': val.id,
+                'mcc': val.mcc,
                 'IMEI': val.imei,
                 'Counts': val.count,
                 'NetworkElementId': val.networkElementId,
@@ -309,7 +359,6 @@ def dataframe_parser(dataframe):
         celldf['weight'] = (celldf['Counts'] / divider)
         celldf['First_seen'] = celldf['First_seen'].dt.strftime('%d.%m.%Y %H:%M:%S UTC')
         celldf['Last_seen'] = celldf['Last_seen'].dt.strftime('%d.%m.%Y %H:%M:%S UTC')
-
     else:
         # Create an empty df.
         celldf = pd.DataFrame()
@@ -318,6 +367,9 @@ def dataframe_parser(dataframe):
 
     # Allow parsing celldf with visidata.
     celldf.to_csv('s3_celldf.tsv', sep='\t', index=False)
+
+    # TODO: finish the next command.
+    # swiss_cells = celldf['mcc'] 
 
     return celldf, neteid_df
 
@@ -340,8 +392,8 @@ def transpose_cells_on_map(dataframe):
     m = folium.Map(location=[46.8182, 8.2275], zoom_start=2, tiles="Cartodb dark_matter")
 
     # Block scroll zoom by default.
-    scrollonoff = ScrollZoomToggler()
-    m.add_child(scrollonoff)
+    # scrollonoff = ScrollZoomToggler()
+    # m.add_child(scrollonoff)
 
     # Allow to draw shapes and add markers.
     Draw(export=False).add_to(m)
@@ -385,12 +437,15 @@ def transpose_cells_on_map(dataframe):
         longitude = row['long']
         km = 2.5
 
-        # Add each azimuth per cell.
-        for azimuth in row['azimuth']:
-            tooltipTag = int(azimuth[0])
-            add_azimuth_line(cell_azimuth, latitude, longitude, azimuth, km, tooltipTag)
+        # Add azimuth for Swiss cell only.
+        if row['Cell_id'].startswith('228'):
+            for azimuth_list in row['azimuth']:
+                for azimuth in azimuth_list:
+                    tooltipTag = int(azimuth)
+                    add_azimuth_line(cell_azimuth, latitude, longitude, azimuth, km, tooltipTag)
 
-    # db(data)
+
+
     # Default, radius=25, blur=15.
     HeatMap(data).add_to(heat)
 
@@ -403,14 +458,22 @@ def transpose_cells_on_map(dataframe):
     return map_file, neteid_df
 
 
+def summary():
+    '''Display summary.'''
+    rprint(Panel.fit(f"Total cells in iri: {tot_cells}", border_style='green', title='Summary', title_align='left'))
+
 @timer
 def main():
-    zipFile = get_path_to_iri()
-    unzip_file(zipFile)
-    find_iri_csv()
+    # zipFile = get_path_to_iri()
+    # unzip_file(zipFile)
+    # find_iri_csv()
+
     csv_to_json(iriFile, iriJsonFile)
-    dframe = json_to_dataframe(iriJsonFile)
+    base_df= json_to_dataframe(iriJsonFile)
+    csv_to_json(iriFile, iriJsonFile)
+    dframe = split_process_concat_dataframe(base_df)
     transpose_cells_on_map(dframe)
+    summary()
 
 
 # TODO: add an option to erase non-necessary files.
