@@ -194,7 +194,7 @@ def check_cell_towers(cellTower_dataList_):
 
         # Google Api.
         if launch_google_api and not error_google_api:
-            GOOGLE_API_KEY = "AIzaSyAopPBHDH2C5LUSE4FRKoKI91YAEu6sdzc"
+            GOOGLE_API_KEY = "ADD_API_KEY_HERE"
             url = f"https://www.googleapis.com/geolocation/v1/geolocate?key={GOOGLE_API_KEY}"
             result = api_requester('google', url, cellTowerData)
             google_checked += 1
@@ -207,7 +207,7 @@ def check_cell_towers(cellTower_dataList_):
 
         # Combain api.
         if launch_combain_api and not error_combain_api:
-            COMBAIN_API_KEY = "vspbj06gzxdzpkjd7714"
+            COMBAIN_API_KEY = "ADD_API_KEY_HERE"
             url = f"https://apiv2.combain.com?key={COMBAIN_API_KEY}"
             result = api_requester('combain', url, cellTowerData)
             combain_checked += 1
