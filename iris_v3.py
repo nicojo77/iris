@@ -1,9 +1,13 @@
 """Convert iri.csv file to json and extracts IMEI related information as well as locations."""
 
-# Both Google and Combain apis share the same error codes.
-# 400 = Parse Error / Invalid key.
-# 403 = Out of credits.
-# 404 = Not found (meaning cell tower not found, api is ok).
+# Remark:
+# Even though this script works (summary needs adapting as numbers are messed up), it takes 
+# up to 3:29.250 to check only one cell-tower in the different databases.
+# The reason is the way how missing cell-towers are handled. Here, the code has been tailored 
+# to process every single cell-tower one after the other. That is, cell-tower 1 data is parsed 
+# to ifc_db and if no result is found, then openCellID, Google api and eventually Combain api.
+#
+# Hence, this version is abandoned.
 
 import csv
 import folium
@@ -20,15 +24,12 @@ import shutil
 import sys
 import time
 import zipfile
-# from datetime import datetime, timezone
 from argparse import ArgumentParser, RawTextHelpFormatter
-# from zoneinfo import ZoneInfo
 from questionary import Style
 from rich import print as rprint
 from rich.console import Console
 from rich.panel import Panel
 from textwrap import dedent
-import constants
 
 from mydebug import timer
 from mydebug import db
@@ -36,20 +37,16 @@ from mydebug import db
 
 console = Console()
 
-# TODO: 
-# Handle sigint.
-# if this version is too complicated to handle, a solution would be to get the number of cell checked 
-# in openCellID and substract it in summmary (mcc_checker is ok).
-
 
 # TODO:
 # Find a way to protect the file against deletion.
 IFC_CELLT_DB = '/home/anon/Documents/git/pythonScripts/iris/IFC_CELLT_DB.parquet'
-TWENTYFOUR_DB = '/home/anon/Documents/git/pythonScripts/iris/24Cellt.parquet'
 
 # Counters for statistics.
 ifc_localised = 0
 ifc_checked = 0
+opencellid_localised = 0
+opencellid_checked = 0
 google_localised = 0
 google_checked = 0
 combain_localised = 0
@@ -145,11 +142,11 @@ def json_to_dataframe(js_file):
     # Load json file to dataframe.
     df = pd.read_json(js_file)
     df['imei'] = df['imei'].astype('Int64', copy=False)
-    df.to_csv('df.csv')
+    df.to_csv('df.tsv', sep='\t')
 
     # WARNING: dropna() appears to crash the structure.
     # df = df.dropna()
-    # df.to_csv('df_dropna.csv')
+    # df.to_csv('df_dropna.tsv', sep='\t')
 
     # Takes only 14-digit number as n15 is check-digit.
     df.dropna(subset=['imei'], inplace=True)
@@ -227,7 +224,7 @@ def json_to_dataframe(js_file):
     base_df['cid'] = base_df['cell_id'].apply(lambda x: x.split('-')[-1])
     # base_df['ecid_short'] = base_df.apply(lambda row: (int(row['cid']) % 65536) if row['cell_idtype'] == 'ECGI' else np.nan, axis=1).astype('Int64')
 
-    base_df.to_csv('base_df.csv')
+    base_df.to_csv('base_df.tsv', sep='\t')
 
     # Get the initial counts for each cell.
     # This never changes and only used in mcc_checker().
@@ -239,8 +236,24 @@ def json_to_dataframe(js_file):
         tot_cells = base_df[filt]['cell_id'].count()
         tot_cells_dic[mcc] = tot_cells
 
+    return base_df,tot_cells_dic
+
+
+def split_process_concat_dataframe(dataframe):
+    '''
+    Split base dataframe, get locations and concat again.
+
+    sdf: Swiss Dataframe, no processing as location already known.
+    nosdf: non-Swiss Dataframe, crosscheck against cell-tower db, and apis.
+
+    This function is launcher of: check_cell_towers(data)
+
+    Return:
+    df, un-filtered dataframe (swiss and foreign cell-towers).
+    data, data format with [cell_id, lat, lon, ts].
+    '''
     # Remove un-wanted columns dynamically with sets.
-    actual_cols = set(base_df.columns)
+    actual_cols = set(dataframe.columns)
     wanted_cols = set([
                     'imei',
                     'imsi',
@@ -267,412 +280,48 @@ def json_to_dataframe(js_file):
                     ])
 
     to_remove_cols = actual_cols.difference(wanted_cols)
-    init_df = base_df.drop(list(to_remove_cols), axis=1)
-    # Remove leading '0' in mnc.
-    init_df['mnc'] = init_df['mnc'].str.lstrip('0')
-    init_df.to_csv('init_df.csv', index=False)
+    df = dataframe.drop(list(to_remove_cols), axis=1)
+    df.to_csv('unprocessed_df.tsv', sep='\t', index=False)
+    init_df = df
 
-    return init_df, tot_cells_dic
-
-# def check_ifc_cellt_db(initial_df):
-#     '''
-#     Check unknown cell-towers against IFC_CELLT_DB.
-#
-#     Return:
-#     # localised (list):     cell-towers localised in IFC_CELLT_DB.
-#     ifc_df (pd df):         current IFC_CELLT_DB database.
-#     updated_df (pd df):     new dataframe with updated coordinates (localised []).
-#     '''
-#     # Remark:
-#     # Be aware that IFC_CELLT_DB also contains data from the other online sources.
-#     # Take that into account if you try to compare the dataframes.
-#     # For example, initially you may have 500 un-localised cells.
-#     # check_ifc_cellt_db() may reveal 400 of them, leaving 100 un-localised.
-#     # check_opencellid() may return 100 hits out of the 100 un-localised cells by check_ifc_cellt_db.
-#     # However, those hits could also have been in the first 400 hits.
-#     #
-#     # The purpose of IFC_CELLT_DB is only to prevent duplicate requests on paid services.
-#
-#
-#     df = initial_df
-#     init_df = initial_df
-#
-#     # Check if IFC_CELLT_DB exists.
-#     global ifc_localised
-#     global ifc_checked
-#
-#     updated_df = pd.DataFrame()
-#     # localised = []
-#     if os.path.isfile(IFC_CELLT_DB):
-#         loaded_ifc_df = pd.read_parquet(IFC_CELLT_DB)
-#         # Filter on current year.
-#         ts_cut = int(time.time()) - 31536000 # 1 year.
-#         filt = (loaded_ifc_df['ts'] > ts_cut)
-#         loaded_ifc_df = loaded_ifc_df[filt]
-#
-#         # Load IRI data and get only cells where location is not known.
-#         df = df[df['location_wgs84.latitude'].isna()].copy()
-#         df = df.drop_duplicates(subset=['cell_id'])
-#         df = df.astype({'mcc': 'Int64', 'mnc': 'Int8', 'lac': 'Int64', 'cid': 'Int64'})
-#
-#         # df = df.merge(loaded_ifc_df[['cell_id', 'lat', 'lon']], # TODO: to test.
-#         df = init_df.merge(loaded_ifc_df[['cell_id', 'lat', 'lon']],
-#                            on=['cell_id'],
-#                            how='left')
-#
-#         df['lat'] = pd.to_numeric(df['lat'], errors='coerce')
-#         df['lon'] = pd.to_numeric(df['lon'], errors='coerce')
-#
-#         # Populate coordinates (lat, lon) to empty location_wgs84 when matches occur.
-#         # Drop un-necessary columns.
-#         df['location_wgs84.latitude'] = df['location_wgs84.latitude'].fillna(df['lat'])
-#         df['location_wgs84.longitude'] = df['location_wgs84.longitude'].fillna(df['lon'])
-#         updated_df = df.drop(['lat', 'lon'], axis=1)
-#         updated_df.to_csv('updated1.csv', index=False)
-#
-#     # IFC_CELLT_DB does not exist, create empty template with columns.
-#     else:
-#         cols = ['cell_id', 'lat', 'lon', 'ts']
-#         loaded_ifc_df = pd.DataFrame(columns=cols)
-#         loaded_ifc_df.astype({'cell_id': str, 'lat': 'Float64', 'lon': 'Float64', 'ts': 'Int64'})
-#
-#     return loaded_ifc_df, updated_df
-
-def check_ifc_cellt_db(initial_df):
-    '''
-    Check unknown cell-towers against IFC_CELLT_DB.
-
-    Return:
-    # localised (list):     cell-towers localised in IFC_CELLT_DB.
-    ifc_df (pd df):         current IFC_CELLT_DB database.
-    updated_df (pd df):     new dataframe with updated coordinates (localised []).
-    '''
-    # Remark:
-    # Be aware that IFC_CELLT_DB also contains data from the other online sources.
-    # Take that into account if you try to compare the dataframes.
-    # For example, initially you may have 500 un-localised cells.
-    # check_ifc_cellt_db() may reveal 400 of them, leaving 100 un-localised.
-    # check_opencellid() may return 100 hits out of the 100 un-localised cells by check_ifc_cellt_db.
-    # However, those hits could also have been in the first 400 hits.
-    #
-    # The purpose of IFC_CELLT_DB is only to prevent duplicate requests on paid services.
-
-    df = initial_df
-    init_df = initial_df
-
-    # Check if IFC_CELLT_DB exists.
-    global ifc_localised
-    global ifc_checked
-
-    updated_df = pd.DataFrame()
-    # localised = []
-    if os.path.isfile(IFC_CELLT_DB):
-        loaded_ifc_df = pd.read_parquet(IFC_CELLT_DB)
-        # Filter on current year.
-        ts_cut = int(time.time()) - 31536000 # 1 year.
-        filt = (loaded_ifc_df['ts'] > ts_cut)
-        loaded_ifc_df = loaded_ifc_df[filt]
-
-    # IFC_CELLT_DB does not exist, create empty template with columns.
-    else:
-        cols = ['cell_id', 'lat', 'lon', 'ts']
-        loaded_ifc_df = pd.DataFrame(columns=cols)
-        loaded_ifc_df.astype({'cell_id': str, 'lat': 'Float64', 'lon': 'Float64', 'ts': 'Int64'})
-
-    # Load IRI data and get only cells where location is not known.
-    df = df[df['location_wgs84.latitude'].isna()].copy()
+    # Get un-localised cells and remove duplicates on cell_id.
+    df = df[df['location_wgs84.latitude'].isna()]
     df = df.drop_duplicates(subset=['cell_id'])
     df = df.astype({'mcc': 'Int64', 'mnc': 'Int8', 'lac': 'Int64', 'cid': 'Int64'})
 
-    # df = df.merge(loaded_ifc_df[['cell_id', 'lat', 'lon']], # TODO: to test if still not working.
-    df = init_df.merge(loaded_ifc_df[['cell_id', 'lat', 'lon']],
-                        on=['cell_id'],
-                        how='left')
-
-    df['lat'] = pd.to_numeric(df['lat'], errors='coerce')
-    df['lon'] = pd.to_numeric(df['lon'], errors='coerce')
-
-    # Populate coordinates (lat, lon) to empty location_wgs84 when matches occur.
-    # Drop un-necessary columns.
-    df['location_wgs84.latitude'] = df['location_wgs84.latitude'].fillna(df['lat'])
-    df['location_wgs84.longitude'] = df['location_wgs84.longitude'].fillna(df['lon'])
-    updated_df = df.drop(['lat', 'lon'], axis=1)
-    updated_df.to_csv('updated1.csv', index=False)
-
-    return loaded_ifc_df, updated_df
-
-
-def check_opencellid(init_df_, updated_df_):
-    '''
-    Check unknown cell-towers against openCellID db.
-
-    Return:
-    tmp_df (pd df):             dataframe to be used in check_online_apis().
-    check_online_apis (bool):   indicator for check_online_apis().
-    final_df (pd df):           final dataframe is no other checks needed.
-
-    '''
-    init_df = init_df_
-    init_df = init_df.astype({'mcc': 'Int64', 'mnc': 'Int8', 'lac': 'Int64', 'cid': 'Int64'})
-    df = updated_df_
-    # check_online_apis = False
-
-    # Get un-localised cells and remove duplicates on cell_id.
-    with_missing_df = df[df['location_wgs84.latitude'].isna()].copy()
-    with_missing_df = with_missing_df.drop_duplicates(subset=['cell_id'])
-    with_missing_df = with_missing_df.astype({'mcc': 'Int64', 'mnc': 'Int8', 'lac': 'Int64', 'cid': 'Int64'})
-
-    openCellID = '/home/anon/Desktop/it_stuff/openCellID/cell_towers.parquet'
-    ocid_df = pd.read_parquet(openCellID, columns=['mcc', 'net', 'area', 'cell', 'lon', 'lat'])
-
-    # tmp_df = df.merge(ocid_df[['mcc', 'net', 'area', 'cell', 'lat', 'lon']],
-    tmp_df = with_missing_df.merge(ocid_df[['mcc', 'net', 'area', 'cell', 'lat', 'lon']],
-                                    left_on=['mcc', 'mnc', 'lac', 'cid'],
-                                    right_on=['mcc', 'net', 'area', 'cell'],
-                                    how='left')
-
-    # Ensure proper handling of NaN values.
-    tmp_df['lat'] = pd.to_numeric(tmp_df['lat'], errors='coerce')
-    tmp_df['lon'] = pd.to_numeric(tmp_df['lon'], errors='coerce')
-
-    # Populate coordinates (lat, lon) to empty location_wgs84 when matches occur.
-    tmp_df['location_wgs84.latitude'] = tmp_df['location_wgs84.latitude'].fillna(tmp_df['lat'])
-    tmp_df['location_wgs84.longitude'] = tmp_df['location_wgs84.longitude'].fillna(tmp_df['lon'])
-    tmp_df = tmp_df.drop(['lat', 'lon', 'cell', 'area', 'net'], axis=1)
-
-    tmp_df = df.copy()
-    tmp_df.update(tmp_df[['cell_id', 'location_wgs84.latitude', 'location_wgs84.longitude']])
-    tmp_df.to_csv('tmp_df.csv', index=False)
-
-    return tmp_df, check_online_apis
-
-
-def check_online_apis(init_df_, loaded_ifc_df_, tmp_df_, check_online_apis):
-    '''
-    Check unknown cell-towers against online apis db.
-
-    Return:
-    final_df (pd df):   final dataframe.
-    '''
-
-    init_df = init_df_
-    loaded_ifc_df = loaded_ifc_df_ # TODO: change naming as too confusing.
-    df =tmp_df_
-
-    # if check_online_apis: # former version.
-
     # Get rid off every cell-towers identified by openCellID.
-    with_missing_df = df[df['location_wgs84.latitude'].isna()].copy()
-    # with_missing_df.to_csv('withmissing1.csv', index=False)
+    nosdf = df
+    nosdf = nosdf[nosdf['location_wgs84.latitude'].isna()]
 
     # Create a set with (cell_id, mcc, mnc, lac and cid).
     # Set will get rid off duplicates automatically.
     data = set()
-    for _, row in with_missing_df.iterrows():
+    for _, row in nosdf.iterrows():
         cell_data = (row['cell_id'], row['mcc'], row['mnc'], row['lac'], row['cid'])
         data.add(cell_data)
 
     # TEST: LIMIT DATA TO N NUMBER OF CELLS.
-    n = 2
     data = sorted(data)
-    data = list(data)[:n]
-    db(f"Testing: restricted to {n} cells.\n{data = }", colour='orange_red1')
+    data = list(data)[:1]
 
-    if os.path.isfile(TWENTYFOUR_DB):
-        db("check_24cellt_db()")
-        in_24cellt = check_24cellt_db(data)
-        if len(in_24cellt) == len(data):
-            db("Every cell-towers already checked in the past 24 hours.", colour='orange_red1')
-            return df
-
-    else:
-        db("check_24cellt_db() not launched")
-
-        # Perform the checks in google and combain apis.
-        localised, apis_df, non_loc_df = check_cell_towers(data)
-        # apis_df.to_csv('apis_df.csv', index=False)
-
-        # Create dataframe with cell tower locations.
-        # Update ifc db with new cell-towers.
-        db(f"check_cell_towers(): {len(localised) = }")
-        cols = ['cell_id', 'lat', 'lon', 'ts']
-        new_loc_df = pd.DataFrame(localised, columns=cols)
-        new_ifc_df = pd.concat([loaded_ifc_df, new_loc_df])
-        new_ifc_df = new_ifc_df.sort_values('ts').drop_duplicates(subset=['cell_id'], keep='last')
-        db("update IFC_CELLT_DB.parquet")
-        new_ifc_df.to_parquet(IFC_CELLT_DB, index=False)
-
-        # Create 24Cellt.parquet only if un-localised cells found.
-        # non_loc_df is created in check_cell_towers().
-        if non_loc_df.empty:
-            db("no un-localised cell-towers found")
-            pass
-        else:
-            db("un-localised cell-towers found, update 24Cellt.parquet")
-            # cols = ['cell_id', 'ts']
-            non_loc_df.to_parquet(TWENTYFOUR_DB, index=False)
+    # Perform the checks in ifc_db, google and combain apis.
+    localised, newdf = check_cell_towers(data)
 
     # Merge coordinates found in check_cell_towers()
-    with_missing_df = with_missing_df.merge(apis_df[['cell_id', 'lat', 'lon']], on=['cell_id'], how='left')
+    new_df = init_df.merge(newdf[['cell_id', 'lat', 'lon']], left_on=['cell_id'], right_on=['cell_id'], how='left')
 
-    # with_missing_df.to_csv('withmissing2.csv', index=False)
-    # # Ensure proper handling of NaN values.
-    with_missing_df['lat'] = pd.to_numeric(with_missing_df['lat'], errors='coerce')
-    with_missing_df['lon'] = pd.to_numeric(with_missing_df['lon'], errors='coerce')
+    # Ensure proper handling of NaN values.
+    new_df['lat'] = pd.to_numeric(new_df['lat'], errors='coerce')
+    new_df['lon'] = pd.to_numeric(new_df['lon'], errors='coerce')
 
     # Populate coordinates (lat, lon) to empty location_wgs84 when matches occur.
     # Drop un-necessary columns.
-    with_missing_df['location_wgs84.latitude'] = with_missing_df['location_wgs84.latitude'].fillna(with_missing_df['lat'])
-    with_missing_df['location_wgs84.longitude'] = with_missing_df['location_wgs84.longitude'].fillna(with_missing_df['lon'])
-    with_missing_df = with_missing_df.drop(['lat', 'lon'], axis=1)
-    # with_missing_df.to_csv('withmissing3.csv', index=False)
+    new_df['location_wgs84.latitude'] = new_df['location_wgs84.latitude'].fillna(new_df['lat'])
+    new_df['location_wgs84.longitude'] = new_df['location_wgs84.longitude'].fillna(new_df['lon'])
+    final_df = new_df.drop(['lat', 'lon'], axis=1)
+    final_df.to_csv('findf.tsv', sep='\t', index=False)
 
-    with_missing_df.dropna(subset=['location_wgs84.latitude'], inplace=True)
-    with_missing_df.drop_duplicates(subset=['cell_id'], inplace=True) # INFO: new.
-    with_missing_df.to_csv('withmissing4.csv', index=False)
-    final_df = df.copy()
-    # final_df.to_csv('final_df.csv', index=False)
-
-    tmp_df = final_df.merge(with_missing_df[['cell_id', 'location_wgs84.latitude', 'location_wgs84.longitude']],
-                        on=['cell_id'], how='left', suffixes=('', '_updated'))
-    tmp_df.to_csv('final_tmp_df.csv', index=False)
-
-    tmp_df['location_wgs84.latitude'] = tmp_df['location_wgs84.latitude'].fillna(tmp_df['location_wgs84.latitude_updated'])
-    tmp_df['location_wgs84.longitude'] = tmp_df['location_wgs84.longitude'].fillna(tmp_df['location_wgs84.longitude_updated'])
-    final_df = tmp_df.drop(['location_wgs84.latitude_updated', 'location_wgs84.longitude_updated'], axis=1)
-
-    final_df.to_csv('final1_df.csv', index=False)
-
-    return final_df
-
-
-def check_24cellt_db(unloc):
-    '''Check non-localised cells against 24cellt.parquet.'''
-    # Load 24cellt.parquet data.
-    twentyFour_df = pd.read_parquet(TWENTYFOUR_DB)
-    ts_cut = (int(time.time()) - 86400) # 1 day.
-    filt = (twentyFour_df['ts'] > ts_cut)
-    df = twentyFour_df[filt]
-
-    in_24cellt_set = set()
-    cellt_list = list(unloc)
-    # db(f"{cellt_list = }")
-    for cell in cellt_list:
-        db(cell[0])
-        if cell[0] in df['cell_id'].values:
-            in_24cellt_set.add(cell)
-
-    # Load current 24Cellt.parquet and update.
-    cols = ['cell_id', 'ts']
-    yet_twentyFour_df = pd.DataFrame(in_24cellt_set, columns=cols)
-    yet_twentyFour_df['ts'] = int(time.time())
-    updated_twentyFour_df = pd.concat([twentyFour_df, yet_twentyFour_df])
-    updated_twentyFour_df = updated_twentyFour_df.sort_values('ts').drop_duplicates(subset=['cell_id'], keep='last')
-    updated_twentyFour_df.to_parquet(TWENTYFOUR_DB, index=False)
-
-    return in_24cellt_set
-
-
-def check_cell_towers(cellTower_dataList_):
-    '''
-    Take cell tower data list from split_process_concat_dataframe().
-    Determine what checks needs performing (ifc_db or apis).
-    Feed api_requester() with a list of cell-towers, parse answers.
-
-    Parameter: cellTower_dataList_ (list), list of cell-towers to be checked.
-
-    Return:
-    localised (list): data format of cell-towers (cell_id, lat, lon, ts).
-    df (pandas df): newly identified cell-towers.
-    '''
-
-    ctdl = cellTower_dataList_
-
-    global google_localised
-    global combain_localised
-    global google_checked
-    global combain_checked
-    global launch_google_api
-    global launch_combain_api
-    global error_google_api
-    global error_combain_api
-
-    localised = []
-    not_localised = []
-
-    # Determine if google and combain works properly.
-    # Do not put inside while loop.
-    # False: errors 400 or 403.
-    error_google_api = False
-    error_combain_api = False
-    i = 0
-    while i < len(ctdl):
-        launch_google_api = True        # launch_google_api = False
-        launch_combain_api = False
-
-        cellTowerData = [
-            {
-                "mobileCountryCode": list(ctdl)[i][1], # mcc.
-                "mobileNetworkCode": list(ctdl)[i][2], # mnc.
-                "locationAreaCode": list(ctdl)[i][3],  # lac.
-                "cellId": list(ctdl)[i][4]             # cid.
-            }
-        ]
-
-        # db(f"mcc: {list(ctdl)[i][1]}\nmnc: {list(ctdl)[i][2]}\nlac: {list(ctdl)[i][3]}\ncid: {list(ctdl)[i][4]}")
-
-        # Google Api.
-        if launch_google_api and not error_google_api:
-            db("Google API", colour='green')
-            GOOGLE_API_KEY = constants.GOOGLE_API_KEY
-            url = f"https://www.googleapis.com/geolocation/v1/geolocate?key={GOOGLE_API_KEY}"
-            result = api_requester('google', url, cellTowerData)
-            google_checked += 1
-            if result:
-                lat = result['location']['lat']
-                lon = result['location']['lng']
-                ts = int(time.time())
-                localised.append([list(ctdl)[i][0], lat, lon, ts])
-                google_localised += 1
-            # else:
-            #     not_localised.append(list(ctdl)[i][0])
-
-        # Combain api.
-        if launch_combain_api and not error_combain_api:
-        # if not error_combain_api:
-            db("Combain API", colour='orange_red1')
-            COMBAIN_API_KEY = constants.COMBAIN_API_KEY
-            url = f"https://apiv2.combain.com?key={COMBAIN_API_KEY}"
-            result = api_requester('combain', url, cellTowerData)
-            combain_checked += 1
-            if result:
-                lat = result['location']['lat']
-                lon = result['location']['lng']
-                ts = int(time.time())
-                localised.append([list(ctdl)[i][0], lat, lon, ts])
-            else:
-                not_localised.append(list(ctdl)[i][0])
-                combain_localised += 1
-
-        # Do not make api requests anymore.
-        if error_google_api and error_combain_api:
-            break
-
-        i += 1
-
-    # Create dataframe with cell tower locations.
-    cols = ['cell_id', 'lat', 'lon', 'ts']
-    apidf = pd.DataFrame(localised, columns=cols)
-    # new_ifc_df = df.combine_first(loaded_ifc_df)
-    # new_ifc_df.to_parquet(IFC_CELLT_DB, index=False)
-
-    # new:
-    cols = ['cell_id']
-    non_loc_df = pd.DataFrame(not_localised, columns=cols)
-    non_loc_df['ts'] = int(time.time())
-
-    # return localised
-    return localised, apidf, non_loc_df
+    return localised, init_df, final_df
 
 
 def api_requester(api, url_, cellTower_data):
@@ -689,8 +338,6 @@ def api_requester(api, url_, cellTower_data):
 
     global launch_google_api
     global launch_combain_api
-    global error_google_api
-    global error_combain_api
 
     headers = {
         "Content-Type": "application/json"
@@ -724,18 +371,12 @@ def api_requester(api, url_, cellTower_data):
                 break
 
             # Api issues (limit or key), no point retrying.
-            errorMsg = dedent('''\
-                                400 = Parse Error / Invalid key.
-                                403 = Out of credits.''')
-
             if status_code in (400, 403):
                 if api == 'google':
-                    db(f"Something went wrong with Google api: {status_code = }\n{errorMsg}", colour='red')
+                    rprint(f"[red]Something went wrong with Google api![/]")
                     error_google_api = True
-                    launch_combain_api = True
-                    # break
                 elif api == 'combain':
-                    db(f"Something went wrong with Combain api: {status_code = }\n{errorMsg}", colour='red')
+                    rprint(f"[red]Something went wrong with Combain api![/]")
                     error_combain_api = True
                 break
 
@@ -757,6 +398,152 @@ def api_requester(api, url_, cellTower_data):
 
     return None
 
+
+def check_cell_towers(cellTower_dataList_):
+    '''
+    Take cell tower data list from split_process_concat_dataframe().
+    Determine what checks needs performing (ifc_db or apis).
+    Feed api_requester() with a list of cell-towers, parse answers.
+
+    Parameter: cellTower_dataList_ (list), list of cell-towers to be checked.
+
+    Return:
+    localised (list): data format of cell-towers (cell_id, lat, lon, ts).
+    df (pandas df): newly identified cell-towers.
+    '''
+
+    ctdl = cellTower_dataList_
+    length_ctdl = len(ctdl)
+
+    global ifc_localised
+    global opencellid_localised #new
+    global google_localised
+    global combain_localised
+
+    global ifc_checked
+    global opencellid_checked #new
+    global google_checked
+    global combain_checked
+
+    global launch_ifc #new
+    global launch_opencellid #new
+    global launch_google_api
+    global launch_combain_api
+
+    localised = []
+
+    # openCellID
+    openCellID = '/home/anon/Desktop/it_stuff/openCellID/cell_towers.parquet'
+    ocid_df = pd.read_parquet(openCellID, columns=['mcc', 'net', 'area', 'cell', 'lon', 'lat'])
+    ocid_df = ocid_df.astype({'mcc': str, 'net': str, 'area': str, 'cell': str})
+
+    # Load ifc3 own database.
+    if os.path.isfile(IFC_CELLT_DB):
+        # db(f"{IFC_CELLT_DB} does exist.", colour='green')
+        ifc_df = pd.read_parquet(IFC_CELLT_DB)
+        # Filter on current year.
+        # ts_cut = int(time.time()) - 20 # test: get rid of files older than 20 seconds. 
+        ts_cut = int(time.time()) - 31536000 # 1 year.
+        filt = (ifc_df['ts'] > ts_cut)
+        ifc_df = ifc_df[filt]
+        launch_ifc = True #new
+
+    # Database does not exist, create empty template with columns.
+    else:
+        # db(f"{IFC_CELLT_DB} does not exist.", colour='red')
+        cols = ['cell_id', 'lat', 'lon', 'ts']
+        ifc_df = pd.DataFrame(columns=cols)
+        ifc_df.astype({'cell_id': str, 'lat': 'Float64', 'lon': 'Float64', 'ts': 'Int64'})
+        launch_ifc = False #new
+
+    i = 0
+    while i < length_ctdl:
+        # Determine if google and combain works properly.
+        # False: errors 400 or 403.
+        error_google_api = False
+        error_combain_api = False
+
+        # Google and Combain apis are checked only if cell tower not in IFC_db and openCellID.
+        launch_google_api = False
+        launch_combain_api = False
+
+        # Data structure for Google and Combain apis.
+        cellTowerData = [
+            {
+                "mobileCountryCode": list(ctdl)[i][1],
+                "mobileNetworkCode": list(ctdl)[i][2],
+                "locationAreaCode": list(ctdl)[i][3],
+                "cellId": list(ctdl)[i][4]
+            }
+        ]
+
+        cell_id = str(list(ctdl)[i][0])
+
+        # ifc_cell_db.
+        if launch_ifc:
+            # Check if cell tower in ifc db.
+            if cell_id in ifc_df['cell_id'].values:
+                # db(f"{cell_id} in ifc_df", colour='green')
+                filt = (ifc_df['cell_id'] == cell_id)
+                lat = (ifc_df[filt]['lat'].values)[-1]
+                lon = (ifc_df[filt]['lon'].values)[-1]
+                ts = (ifc_df[filt]['ts'].values)[-1]
+                localised.append([cell_id, lat, lon, ts])
+                ifc_localised += 1
+                ifc_checked += 1
+
+        # openCellID.
+        mcc = str(list(ctdl)[i][1])
+        mnc = str(list(ctdl)[i][2])
+        lac = str(list(ctdl)[i][3])
+        cid = str(list(ctdl)[i][4])
+        opencellid_checked += 1
+        for _, row in ocid_df.iterrows():
+            if (mcc in row['mcc']) and (mnc in row['net']) and (lac in row['area']) and (cid in row['cell']):
+                lat = ocid_df['lat']
+                lon = ocid_df['lon']
+                ts = int(time.time())
+                localised.append([cell_id, lat, lon, ts])
+                opencellid_localised += 1
+            else:
+                launch_google_api = True
+
+        # Google api.
+        if launch_google_api and not error_google_api:
+            GOOGLE_API_KEY = "ADD_API_KEY_HERE"
+            url = f"https://www.googleapis.com/geolocation/v1/geolocate?key={GOOGLE_API_KEY}"
+            result = api_requester('google', url, cellTowerData)
+            google_checked += 1
+            if result:
+                lat = result['location']['lat']
+                lon = result['location']['lng']
+                ts = int(time.time())
+                localised.append([cell_id, lat, lon, ts])
+                google_localised += 1
+
+        # Combain api.
+        if launch_combain_api and not error_combain_api:
+            COMBAIN_API_KEY = "ADD_API_KEY_HERE"
+            url = f"https://apiv2.combain.com?key={COMBAIN_API_KEY}"
+            result = api_requester('combain', url, cellTowerData)
+            combain_checked += 1
+            if result:
+                lat = result['location']['lat']
+                lon = result['location']['lng']
+                ts = int(time.time())
+                localised.append([cell_id, lat, lon, ts])
+                combain_localised += 1
+
+        i += 1
+
+    # Create dataframe with cell tower locations.
+    # Update ifc db with new cell-towers.
+    cols = ['cell_id', 'lat', 'lon', 'ts']
+    df = pd.DataFrame(localised, columns=cols)
+    new_ifc_df = df.combine_first(ifc_df)
+    new_ifc_df.to_parquet(IFC_CELLT_DB, index=False)
+
+    return localised, df
 
 
 class Cell():
@@ -800,7 +587,7 @@ def dataframe_parser(dataframe):
     df['location_azimuth'] = df['location_azimuth'].fillna(0)
 
     # Allow parsing data with visidata.
-    df.to_csv('s2_cell_data.csv', index=False)
+    df.to_csv('s2_cell_data.tsv', sep='\t', index=False)
 
     # Get unique cells.
     cells = df['cell_id'].unique()
@@ -862,7 +649,7 @@ def dataframe_parser(dataframe):
     neteid_df = pd.DataFrame()
 
     # Allow parsing celldf with visidata.
-    celldf.to_csv('s3_celldf.csv', index=False)
+    celldf.to_csv('s3_celldf.tsv', sep='\t', index=False)
 
     return celldf, neteid_df
 
@@ -961,16 +748,8 @@ def transpose_cells_on_map(dataframe):
 # Not localised:                              347 (42.73 %)
 
 
-def summary(initdf_, localised_):
+def summary(unprocessed_dataframe, localised_):
     '''Display statistics on localisation rate per db or apis.'''
-
-    # Un-localised unique cell-towers:            812
-    #   - returns the overall number of unique cells.
-    # Cell-towers identified by openCellID:       247/812 (30.42 %)
-    #   - returns the number of those cells identified by openCellID.
-    #     At this stage, this is n openCellID localised / total unique cells.
-    # Cell-towers identified by IFC_CELLT_DB:     565/565 (100.00 %)
-    #   - returns the numbers identified in other db, included the cells that have already been found.
 
     def api_stat(api, x_localised, checked):
         '''Return counts and percentage per api'''
@@ -981,7 +760,7 @@ def summary(initdf_, localised_):
             rprint(f"{msg.ljust(44)}{x_localised}/{checked} ({percentage:.2f} %)")
 
     # Get unique un-localised cells.
-    n_unlocalised = initdf_.drop_duplicates(subset=['cell_id'])['location_wgs84.latitude'].isna().sum()
+    n_unlocalised = unprocessed_dataframe.drop_duplicates(subset=['cell_id'])['location_wgs84.latitude'].isna().sum()
     n_openCId = n_unlocalised - len(localised_)
 
     msgTot = f"[bold italic green]Un-localised unique cell-towers:[/]"
@@ -996,7 +775,7 @@ def summary(initdf_, localised_):
     return None
 
 
-def mcc_checker(initdf_, finaldf_, cell_counter_dic):
+def mcc_checker(unprocessed_dataframe, processed_dataframe, cell_counter_dic):
     '''Statistics on cell-towers and localised ratios.'''
 
     # Counters for initial cells do not change over time.
@@ -1004,18 +783,18 @@ def mcc_checker(initdf_, finaldf_, cell_counter_dic):
     totCell = cell_counter_dic
 
     # Get the list of unique mcc.
-    findf = finaldf_
-    findf['mcc'] = findf['mcc'].astype(str)
-    mcc_list = findf['mcc'].unique()
+    pro_df = processed_dataframe
+    pro_df['mcc'] = pro_df['mcc'].astype(str)
+    mcc_list = pro_df['mcc'].unique()
 
     # Create the data structure for statistics.
     data = []
     for mcc in mcc_list:
-        filt = (findf['mcc'] == mcc)
+        filt = (pro_df['mcc'] == mcc)
         country_name = mobile_codes.mcc(mcc)[0].name if mobile_codes.mcc(mcc) else "UNKNOWN"
-        unique_cells = findf[filt]['cell_id'].nunique()
-        # unique_cell_df = findf[findf['mcc'] == int(mcc)].drop_duplicates(subset=['cell_id'])
-        unique_cell_df = findf[filt].drop_duplicates(subset=['cell_id'])
+        unique_cells = pro_df[filt]['cell_id'].nunique()
+        # unique_cell_df = pro_df[pro_df['mcc'] == int(mcc)].drop_duplicates(subset=['cell_id'])
+        unique_cell_df = pro_df[filt].drop_duplicates(subset=['cell_id'])
         unique_localised = unique_cell_df[unique_cell_df['location_wgs84.latitude'].notna()]['cell_id'].nunique()
         loc_ratios = ((unique_localised * 100) / unique_cells) if unique_cells > 0 else 0
         data.append([mcc, country_name, totCell[mcc] , unique_cells, unique_localised, f"{loc_ratios:.2f}%"])
@@ -1034,26 +813,19 @@ def mcc_checker(initdf_, finaldf_, cell_counter_dic):
 def main():
     print()
     # zipFile = get_path_to_iri()
-    # with console.status("[bold][italic][green]Processing iri file...[/]"):
-    # unzip_file(zipFile)
-    # find_iri_csv()
+    with console.status("[bold][italic][green]Processing iri file...[/]"):
+        # unzip_file(zipFile)
+        # find_iri_csv()
 
-    csv_to_json(iriFile, iriJsonFile)
-    init_df, counterDic = json_to_dataframe(iriJsonFile)
-    loaded_ifc_df, updated_df = check_ifc_cellt_db(init_df)
-    tmp_df, checkonlineapis = check_opencellid(init_df, updated_df)
-    final_df = check_online_apis(init_df, loaded_ifc_df, tmp_df, checkonlineapis)
+        csv_to_json(iriFile, iriJsonFile)
+        base_df, counterDic = json_to_dataframe(iriJsonFile)
+        localised, unprodf, prodf = split_process_concat_dataframe(base_df) # test: dftest
+        transpose_cells_on_map(prodf)
 
-    # localised, initdf, final_df = split_process_concat_dataframe(init_df) # no longer used
-
-    # transpose_cells_on_map(init_df)
-    transpose_cells_on_map(final_df)
-
-    # summary(init_df, localised)
+    summary(unprodf, localised)
     # mcc_checker(dframe, counterDic)
+    mcc_checker(unprodf, prodf, counterDic)
 
-    # mcc_checker(init_df, init_df, counterDic)
-    mcc_checker(init_df, final_df, counterDic)
 
 # TODO: add an option to erase non-necessary files.
 # Modify argMessage.
